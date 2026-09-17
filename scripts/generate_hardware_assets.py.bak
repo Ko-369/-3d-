@@ -1,0 +1,891 @@
+from __future__ import annotations
+import math, os, random
+from pathlib import Path
+import numpy as np
+import trimesh
+from trimesh.visual.material import PBRMaterial
+from shapely.geometry import Polygon
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+ROOT = Path(__file__).resolve().parents[1]
+MODEL_DIR = ROOT / 'public' / 'models'
+ART_DIR = ROOT / 'public' / 'hardware'
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+ART_DIR.mkdir(parents=True, exist_ok=True)
+
+# Original published bounding boxes (centre + extents per axis). Every regenerated
+# model is normalised onto these so the FIT_SIZE hotspot coordinates authored
+# against the originals keep landing on the right structures.
+TARGET_BBOX = {
+    "case":        {"center": [0.0375, 0.0, 0.0],      "extents": [3.275, 3.4, 2.39]},
+    "cooling":     {"center": [0.0, -0.0375, 0.265],   "extents": [2.5, 2.625, 1.83]},
+    "cpu":         {"center": [0.0, 0.0, 0.0063],      "extents": [3.1, 3.1, 0.7875]},
+    "gpu":         {"center": [0.0, 0.075, 0.295],     "extents": [3.8, 2.41, 1.47]},
+    "memory":      {"center": [0.0, -0.045, 0.125],    "extents": [3.6, 1.34, 0.41]},
+    "motherboard": {"center": [0.0, 0.0025, 0.1925],   "extents": [3.6, 3.255, 0.515]},
+    "network":     {"center": [-0.0075, 0.0, 0.1737],  "extents": [3.565, 2.2, 0.4925]},
+    "power":       {"center": [0.0, 0.0625, 0.1075],   "extents": [3.25, 2.825, 2.665]},
+    "storage":     {"center": [0.0, -0.0475, 0.11],    "extents": [3.55, 1.345, 0.34]},
+}
+
+# Palette: premium workstation / lab instrumentation
+C = {
+    'board': '#122a2e', 'board2': '#183941', 'black': '#11171c', 'graphite': '#20272f',
+    'silver': '#b9c5cb', 'metal': '#7b8992', 'cyan': '#55d8e8', 'teal': '#2bb7a9',
+    'amber': '#efb54a', 'orange': '#e9894a', 'blue': '#5a8dee', 'violet': '#9f7aea',
+    'green': '#6fcf97', 'red': '#ef6b6b', 'cream': '#e7eef0', 'gold': '#d6a84e',
+    'darkmetal': '#3a444c', 'deep': '#0c1419',
+}
+
+def _rgb(hexstr):
+    h = hexstr.lstrip('#')
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+# --- procedural PBR texture library -------------------------------------
+# This is the lever that makes the anatomy/heart models read as "real": surface
+# relief (normal maps), per-pixel roughness/metalness variation, and per-material
+# detail (PCB traces, brushed grain, gold fingers). Each set is generated once
+# and shared by every mesh of a material. They bake into the GLB as WebP-less
+# PNGs the viewer's MeshStandardMaterial picks up automatically.
+
+N_TEX = 256
+
+def _speckle(img, amp=8.0):
+    n = (np.random.rand(*img.shape[:2], 1).astype(np.float32) - 0.5) * 2 * amp
+    return np.clip(img + n, 0, 255)
+
+def _h2n(h, strength=2.0):
+    h = h.astype(np.float32)
+    gy = np.zeros_like(h); gx = np.zeros_like(h)
+    gy[1:-1, :] = h[2:, :] - h[:-2, :]
+    gx[:, 1:-1] = h[:, 2:] - h[:, :-2]
+    nx = -gx * strength; ny = -gy * strength; nz = np.ones_like(h)
+    norm = np.sqrt(nx*nx + ny*ny + nz*nz) + 1e-8
+    arr = np.stack([nx/norm, ny/norm, nz/norm], -1)
+    return Image.fromarray(((arr * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8))
+
+def _rgba(arr):
+    a = np.full((*arr.shape[:2], 1), 255, dtype=np.uint8)
+    return Image.fromarray(np.concatenate([arr.astype(np.uint8), a], -1))
+
+def _mr(met, rough, N, met_var=0.04, rough_var=0.06):
+    m = np.clip(np.random.normal(met, met_var, N*N).reshape(N, N), 0, 1)
+    r = np.clip(np.random.normal(rough, rough_var, N*N).reshape(N, N), 0, 1)
+    out = np.zeros((N, N, 3), dtype=np.uint8)
+    out[..., 1] = (r * 255).astype(np.uint8)   # G = roughness
+    out[..., 2] = (m * 255).astype(np.uint8)   # B = metalness
+    out[..., 0] = 255
+    return _rgba(out)
+
+def tex_pcb(color, N=N_TEX):
+    rng = random.Random(7)
+    alb = Image.new('RGB', (N, N), _rgb(color)); h = Image.new('L', (N, N), 0)
+    da, dh = ImageDraw.Draw(alb), ImageDraw.Draw(h)
+    copper = (198, 162, 104)
+    # copper traces
+    for _ in range(120):
+        x, y = rng.randint(0, N), rng.randint(0, N)
+        if rng.random() < 0.5:
+            L, w = rng.randint(18, 120), rng.randint(1, 2)
+            da.rectangle([x, y, x+L, y+w], fill=copper); dh.rectangle([x, y, x+L, y+w], fill=150)
+        else:
+            L, w = rng.randint(18, 120), rng.randint(1, 2)
+            da.rectangle([x, y, x+w, y+L], fill=copper); dh.rectangle([x, y, x+w, y+L], fill=150)
+    # solder pads / vias
+    for _ in range(140):
+        x, y = rng.randint(0, N-6), rng.randint(0, N-6)
+        da.ellipse([x, y, x+5, y+5], fill=copper); dh.ellipse([x, y, x+5, y+5], fill=210)
+    # silkscreen: white component outlines + labels
+    sil = (214, 224, 222)
+    for _ in range(16):
+        x, y = rng.randint(8, N-34), rng.randint(8, N-30)
+        w, hh = rng.randint(14, 42), rng.randint(10, 28)
+        da.rectangle([x, y, x+w, y+hh], outline=sil, width=1)
+    for _ in range(3):
+        x, y = rng.randint(4, N-40), rng.randint(4, N-8)
+        da.line([x, y, x+30, y], fill=sil, width=1)
+        da.line([x, y+4, x+30, y+4], fill=sil, width=1)
+    try:
+        fnt = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 9)
+        for _ in range(5):
+            x, y = rng.randint(4, N-30), rng.randint(4, N-8)
+            da.text((x, y), rng.choice(['CPU', 'RAM', 'PCIe', 'M.2', 'PWM', 'VCORE', 'DIMM']), fill=sil, font=fnt)
+    except Exception:
+        pass
+    base = _speckle(np.array(alb).astype(np.float32), 5)
+    return _rgba(base), _h2n(np.array(h).astype(np.float32), 1.6), _mr(0.18, 0.6, N, 0.05, 0.09)
+
+def tex_brush(color, N=N_TEX):
+    rng = random.Random(3)
+    base = np.array(Image.new('RGB', (N, N), _rgb(color))).astype(np.float32)
+    h = np.zeros((N, N), dtype=np.float32)
+    for x in range(N):
+        v = rng.uniform(-9, 9); base[x, :, :] += v; h[x, :] += v * 0.02
+    base = _speckle(base, 3)
+    return _rgba(base), _h2n(h, 1.2), _mr(0.85, 0.3, N, 0.03, 0.05)
+
+def tex_plastic(color, N=N_TEX):
+    base = np.array(Image.new('RGB', (N, N), _rgb(color))).astype(np.float32)
+    base = _speckle(base, 7)
+    h = (np.random.rand(N, N).astype(np.float32) - 0.5) * 0.1
+    return _rgba(base), _h2n(h, 0.6), _mr(0.22, 0.45, N, 0.04, 0.06)
+
+def tex_accent(color, N=N_TEX):
+    base = np.array(Image.new('RGB', (N, N), _rgb(color))).astype(np.float32)
+    base = _speckle(base, 5)
+    da = ImageDraw.Draw(Image.fromarray(base.astype(np.uint8)))
+    r, g, b = _rgb(color); dg = tuple(max(0, c-32) for c in (r, g, b))
+    for y in range(0, N, 16):
+        for x in range(0, N, 16):
+            da.ellipse([x+6, y+6, x+8, y+8], fill=dg)
+    h = (np.random.rand(N, N).astype(np.float32) - 0.5) * 0.08
+    return _rgba(base), _h2n(h, 0.5), _mr(0.2, 0.28, N, 0.03, 0.05)
+
+def tex_copper(color, N=N_TEX):
+    rng = random.Random(9)
+    base = np.array(Image.new('RGB', (N, N), _rgb(color))).astype(np.float32)
+    h = np.zeros((N, N), dtype=np.float32)
+    for x in range(N):
+        v = rng.uniform(-11, 11); base[x, :, :] += v; h[x, :] += v * 0.02
+    base = _speckle(base, 3)
+    return _rgba(base), _h2n(h, 1.2), _mr(0.8, 0.25, N, 0.03, 0.05)
+
+def tex_gold(color, N=N_TEX):
+    base = np.array(Image.new('RGB', (N, N), _rgb(color))).astype(np.float32)
+    h = np.zeros((N, N), dtype=np.float32)
+    stripe = 8
+    for y in range(0, N, stripe):
+        base[y:y+stripe//2, :, :] *= 0.82; h[y:y+stripe//2, :] = -0.5
+    base = _speckle(base, 4)
+    return _rgba(base), _h2n(h, 1.0), _mr(0.9, 0.2, N, 0.02, 0.04)
+
+def tex_ceramic(color, N=N_TEX):
+    base = np.array(Image.new('RGB', (N, N), _rgb(color))).astype(np.float32)
+    base = _speckle(base, 6)
+    h = (np.random.rand(N, N).astype(np.float32) - 0.5) * 0.12
+    return _rgba(base), _h2n(h, 0.5), _mr(0.12, 0.5, N, 0.03, 0.06)
+
+def tex_recess(color, N=N_TEX):
+    base = np.array(Image.new('RGB', (N, N), _rgb(color))).astype(np.float32)
+    base = _speckle(base, 4)
+    h = (np.random.rand(N, N).astype(np.float32) - 0.5) * 0.06
+    return _rgba(base), _h2n(h, 0.4), _mr(0.35, 0.6, N, 0.04, 0.07)
+
+def tex_chip(color=C['black'], N=N_TEX):
+    """Black IC package: laser-etched marking frame, pin-1 dot, faint text lines."""
+    rng = random.Random(11)
+    base = np.array(Image.new('RGB', (N, N), _rgb(color))).astype(np.float32)
+    da = ImageDraw.Draw(Image.fromarray(base.astype(np.uint8)))
+    mk = tuple(max(0, c - 34) for c in _rgb(color))
+    da.rectangle([N*0.16, N*0.20, N*0.84, N*0.80], outline=mk, width=2)
+    da.ellipse([N*0.10, N*0.10, N*0.20, N*0.20], fill=mk)
+    for y in np.linspace(N*0.30, N*0.72, 5):
+        da.line([N*0.22, y, N*0.78, y], fill=mk, width=1)
+    try:
+        fnt = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 11)
+        da.text((N*0.26, N*0.50), 'IC', fill=mk, font=fnt)
+    except Exception:
+        pass
+    base = _speckle(base, 4)
+    h = (np.random.rand(N, N).astype(np.float32) - 0.5) * 0.08
+    return _rgba(base), _h2n(h, 0.5), _mr(0.25, 0.42, N, 0.03, 0.05)
+
+def tex_heatsink(color=C['metal'], N=N_TEX):
+    """Aluminium fin-stack: brushed grain + faint vertical fin seams."""
+    rng = random.Random(21)
+    base = np.array(Image.new('RGB', (N, N), _rgb(color))).astype(np.float32)
+    h = np.zeros((N, N), dtype=np.float32)
+    for x in range(N):
+        v = rng.uniform(-7, 7); base[x, :, :] += v; h[x, :] += v * 0.02
+    for y in range(0, N, 6):
+        base[y:y+1, :, :] *= 0.9; h[y:y+1, :] = -0.4
+    base = _speckle(base, 3)
+    return _rgba(base), _h2n(h, 1.0), _mr(0.85, 0.3, N, 0.03, 0.05)
+
+def tex_backplate(color=C['graphite'], N=N_TEX):
+    """Brushed gunmetal with an embossed brand wordmark."""
+    rng = random.Random(33)
+    base = np.array(Image.new('RGB', (N, N), _rgb(color))).astype(np.float32)
+    for x in range(N):
+        v = rng.uniform(-6, 6); base[x, :, :] += v
+    da = ImageDraw.Draw(Image.fromarray(base.astype(np.uint8)))
+    light = tuple(min(255, c + 42) for c in _rgb(color))
+    dark = tuple(max(0, c - 30) for c in _rgb(color))
+    try:
+        fnt = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 24)
+        da.text((N*0.10, N*0.40), 'GPU', fill=light, font=fnt)
+    except Exception:
+        pass
+    h = np.zeros((N, N), dtype=np.float32)
+    base = _speckle(base, 3)
+    return _rgba(base), _h2n(h, 0.4), _mr(0.7, 0.34, N, 0.03, 0.05)
+
+TEXFN = {'pcb': tex_pcb, 'brush': tex_brush, 'plastic': tex_plastic,
+         'accent': tex_accent, 'copper': tex_copper, 'gold': tex_gold,
+         'ceramic': tex_ceramic, 'recess': tex_recess,
+         'chip': tex_chip, 'heatsink': tex_heatsink, 'backplate': tex_backplate}
+
+# material spec: name -> (color, metallic, roughness, emissive, tex_kind)
+MATSPEC = {
+    'board':      (C['board'],     .15, .55, None,     'pcb'),
+    'board2':     (C['board2'],    .12, .50, None,     'pcb'),
+    'black':      (C['black'],     .20, .40, None,     'plastic'),
+    'graphite':   (C['graphite'],  .50, .34, None,     'plastic'),
+    'silver':     (C['silver'],    .85, .28, None,     'brush'),
+    'metal':      (C['metal'],     .78, .34, None,     'brush'),
+    'darkmetal':  (C['darkmetal'], .65, .32, None,     'brush'),
+    'cyan':       (C['cyan'],      .25, .30, C['cyan'],    'accent'),
+    'teal':       (C['teal'],      .20, .34, C['teal'],    'accent'),
+    'amber':      (C['amber'],     .35, .28, C['amber'],   'accent'),
+    'blue':       (C['blue'],      .25, .30, None,     'accent'),
+    'violet':     (C['violet'],    .30, .34, None,     'accent'),
+    'green':      (C['green'],     .25, .34, None,     'accent'),
+    'red':        (C['red'],       .30, .30, None,     'accent'),
+    'orange':     (C['orange'],    .80, .22, None,     'copper'),
+    'gold':       (C['gold'],      .88, .18, None,     'gold'),
+    'cream':      (C['cream'],     .15, .45, None,     'ceramic'),
+    'deep':       (C['deep'],      .35, .55, None,     'recess'),
+    'chip':       (C['black'],     .25, .42, None,     'chip'),
+    'heatsink':   (C['metal'],     .85, .30, None,     'heatsink'),
+    'backplate':  (C['graphite'],  .70, .34, None,     'backplate'),
+}
+
+TEX = {name: TEXFN[kind](color) for name, (color, _, _, _, kind) in MATSPEC.items()}
+
+# tiles-per-world-unit when baking UVs; brushed metals want fine grain
+DENSITY = {'board': 5, 'board2': 5, 'black': 5, 'graphite': 5,
+           'silver': 11, 'metal': 11, 'darkmetal': 11,
+           'cyan': 4, 'teal': 4, 'amber': 4, 'blue': 4, 'violet': 4, 'green': 4, 'red': 4,
+           'orange': 10, 'gold': 7, 'cream': 6, 'deep': 4,
+           'chip': 5, 'heatsink': 11, 'backplate': 7}
+
+def mat(name, color, metallic, rough, emissive, kind):
+    alb, normal, mr = TEX[name]
+    return PBRMaterial(name=name, baseColorTexture=alb, normalTexture=normal,
+                       metallicRoughnessTexture=mr, metallicFactor=1.0, roughnessFactor=1.0,
+                       emissiveFactor=(tuple(v/255 for v in _rgb(emissive)) if emissive else None))
+
+M = {name: mat(name, *spec) for name, spec in MATSPEC.items()}
+
+# Tempered-glass side panel: translucent, highly reflective, no albedo texture.
+_glass_albedo = Image.new('RGB', (4, 4), (200, 225, 235))
+M['glass'] = PBRMaterial(name='glass', baseColorTexture=_glass_albedo,
+                         metallicFactor=0.0, roughnessFactor=0.06,
+                         alphaMode='BLEND', baseColorFactor=(0.80, 0.88, 0.94, 0.20))
+DENSITY['glass'] = 1
+
+def _rounded_rect_points(w, h, r, seg=8):
+    """Ordered perimeter points of a rounded rectangle centred on the origin."""
+    a, b = w / 2, h / 2
+    r = min(r, a * 0.999, b * 0.999)
+    pts = []
+    # (centre_x, centre_y, start_angle_deg)
+    corners = [(a - r, b - r, 0), (-a + r, b - r, 90),
+               (-a + r, -b + r, 180), (a - r, -b + r, 270)]
+    for (cx, cy, sa) in corners:
+        for k in range(seg + 1):
+            ang = math.radians(sa + 90 * k / seg)
+            pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+    return pts
+
+def rbox(extents, pos=(0, 0, 0), material='graphite', radius=0.06, seg=8,
+         round_plane='xy'):
+    """A box with rounded perimeter edges (the most visible ones) and flat caps.
+    Keeps the same outer bounding box as a sharp box of `extents`, so the
+    loader's FIT_SIZE normalisation and authored hotspots stay valid."""
+    sx, sy, sz = extents
+    if round_plane == 'xy':
+        w, h, depth = sx, sy, sz
+    elif round_plane == 'xz':
+        w, h, depth = sx, sz, sy
+    else:  # 'yz'
+        w, h, depth = sy, sz, sx
+    poly = Polygon(_rounded_rect_points(w, h, radius, seg))
+    mesh = trimesh.creation.extrude_polygon(poly, height=depth)
+    mesh.apply_translation((0, 0, -depth / 2))
+    if round_plane == 'xz':
+        mesh.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [1, 0, 0]))
+    elif round_plane == 'yz':
+        mesh.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [0, 1, 0]))
+    mesh.apply_translation(pos)
+    mesh.metadata['mat'] = material
+    return mesh
+
+def box(extents, pos=(0, 0, 0), material='graphite'):
+    """Sharp box kept for tiny detail parts where rounding is invisible."""
+    mesh = trimesh.creation.box(extents=extents)
+    mesh.apply_translation(pos)
+    mesh.metadata['mat'] = material
+    return mesh
+
+def cyl(radius, height, pos=(0, 0, 0), axis='y', material='metal', sections=32):
+    mesh = trimesh.creation.cylinder(radius=radius, height=height, sections=sections)
+    if axis == 'y':
+        pass
+    elif axis == 'x':
+        mesh.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [0, 1, 0]))
+    elif axis == 'z':
+        mesh.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [1, 0, 0]))
+    mesh.apply_translation(pos)
+    mesh.metadata['mat'] = material
+    return mesh
+
+def screw(pos, axis='y', r=0.05, material='silver', head='graphite'):
+    """A small counter-sunk screw: a metal shaft plus a recessed darker head."""
+    parts = [cyl(r, 0.05, pos, axis, material, 18)]
+    hp = list(pos)
+    d = 0.03 if axis == 'y' else 0.03
+    if axis == 'y':
+        hp[1] += 0.03
+    elif axis == 'x':
+        hp[0] += 0.03
+    else:
+        hp[2] += 0.03
+    parts.append(cyl(r * 1.15, 0.025, tuple(hp), axis, head, 18))
+    return parts
+
+def tube(radius, length, pos, axis='y', material='orange'):
+    return cyl(radius, length, pos, axis=axis, material=material, sections=20)
+
+def box_uv(mesh, density=6.0):
+    """Per-face planar (box-projection) UVs so tiled PBR maps read correctly on
+    hard-surface parts without a full unwrap. Density is tiles-per-world-unit so
+    texel density stays consistent across parts of different sizes."""
+    verts = mesh.vertices; faces = mesh.faces; fn = mesh.face_normals
+    uv = np.zeros((len(verts), 2), dtype=np.float32)
+    for f in range(len(faces)):
+        n = fn[f]; ax = int(np.argmax(np.abs(n)))
+        axes = [j for j in range(3) if j != ax]
+        vc = verts[faces[f]]
+        u = vc[:, axes[0]] * density
+        v = vc[:, axes[1]] * density
+        uv[faces[f]] = np.column_stack([u, v])
+    uv -= uv.min(0)
+    return uv
+
+def fan(radius, thick, pos=(0, 0, 0), axis='y', blades=11, material='graphite', hub='silver'):
+    """A bladed fan: centre hub + pitched blades, oriented along `axis`."""
+    parts = [cyl(radius * 0.34, thick * 1.6, (0, 0, 0), 'y', hub, 40)]
+    for i in range(blades):
+        a = 2 * math.pi * i / blades
+        bx, bz = math.cos(a) * (radius * 0.6), math.sin(a) * (radius * 0.6)
+        bl = rbox((radius * 0.74, thick * 0.5, 0.045), (bx, 0, bz), material, .01, 3, 'xz')
+        bl.apply_transform(trimesh.transformations.rotation_matrix(-a, [0, 1, 0], point=[bx, 0, bz]))
+        bl.apply_transform(trimesh.transformations.rotation_matrix(0.55, [1, 0, 0]))
+        parts.append(bl)
+    rot = None
+    if axis == 'x':
+        rot = trimesh.transformations.rotation_matrix(math.pi / 2, [0, 0, 1])
+    elif axis == 'z':
+        rot = trimesh.transformations.rotation_matrix(math.pi / 2, [1, 0, 0])
+    for p in parts:
+        if rot is not None:
+            p.apply_transform(rot)
+        p.apply_translation(pos)
+    return parts
+
+def fin_stack(w, h, d, n, pos, material='metal', fill=0.7):
+    """Heatsink fin stack (thin fins spaced along Y) — the signature detail of
+    real coolers and VRM/chipset blocks. A thin fin with a real air gap between
+    reads far more 'metal' than a solid slab."""
+    parts = []; gap = h / n
+    for i in range(n):
+        parts.append(rbox((w, gap * fill, d), (0, -h/2 + gap * (i + 0.5), 0), material, .008, 3, 'xz'))
+    for p in parts:
+        p.apply_translation(pos)
+    return parts
+
+def grille(w, h, pos, pitch=0.16, bar=0.03, border=0.08, depth=0.05,
+           material='darkmetal', plane='xy'):
+    """Perforated vent panel approximated by a frame plus intersecting bars
+    (no boolean ops, but it reads as a metal mesh grille). Built in XY then
+    rotated onto `plane` so callers just pass world `pos`."""
+    parts = [rbox((w, h, depth), (0, 0, 0), material, .02, 4, 'xy')]
+    nx = max(2, int(round((w - 2 * border) / pitch)))
+    ny = max(2, int(round((h - 2 * border) / pitch)))
+    bw = (w - 2 * border) / nx; bh = (h - 2 * border) / ny
+    for i in range(nx + 1):
+        x = -w / 2 + border + i * bw
+        parts.append(rbox((bar, h - 2 * border, depth * 0.9), (x, 0, 0), material, .008, 3, 'xy'))
+    for j in range(ny + 1):
+        y = -h / 2 + border + j * bh
+        parts.append(rbox((w - 2 * border, bar, depth * 0.9), (0, y, 0), material, .008, 3, 'xy'))
+    rot = (trimesh.transformations.rotation_matrix(math.pi / 2, [1, 0, 0]) if plane == 'xz'
+           else trimesh.transformations.rotation_matrix(math.pi / 2, [0, 1, 0]) if plane == 'yz' else None)
+    for p in parts:
+        if rot is not None:
+            p.apply_transform(rot)
+        p.apply_translation(pos)
+    return parts
+
+def cap_can(r, h, pos, axis='y', material='silver', top='graphite'):
+    """Electrolytic capacitor: cylinder body with a slightly domed cap."""
+    parts = [cyl(r, h, pos, axis, material, 28)]
+    hp = list(pos)
+    if axis == 'y':
+        hp[1] += h / 2
+    elif axis == 'x':
+        hp[0] += h / 2
+    else:
+        hp[2] += h / 2
+    parts.append(cyl(r * 0.95, h * 0.08, tuple(hp), axis, top, 28))
+    return parts
+
+def chip(w, d, h, pos, plane='xz', material='chip'):
+    """Surface-mount IC package; `tex_chip` supplies the etched marking."""
+    return [rbox((w, h, d), pos, material, .02, 4, plane)]
+
+def vent_slats(w, h, pos, plane='xy', n=7, gap=0.07, depth=0.04, material='darkmetal'):
+    """Parallel ventilation slats on a panel (e.g. GPU shroud side / PSU shroud)."""
+    parts = []
+    span = h if plane == 'xy' else w
+    for i in range(n):
+        off = -span / 2 + (i + 0.5) * (span / n)
+        if plane == 'xy':
+            parts.append(rbox((w, gap, depth), (pos[0], pos[1] + off, pos[2]), material, .01, 3, 'xy'))
+        else:
+            parts.append(rbox((gap, h, depth), (pos[0] + off, pos[1], pos[2]), material, .01, 3, 'xy'))
+    return parts
+
+def scene_export(name, meshes):
+    sc = trimesh.Scene()
+    flat = []
+    for m in meshes:
+        if isinstance(m, list):
+            flat.extend(m)
+        else:
+            flat.append(m)
+    for i, m in enumerate(flat):
+        key = m.metadata.get('mat', 'graphite')
+        m.visual = trimesh.visual.TextureVisuals(
+            uv=box_uv(m, DENSITY.get(key, 5)),
+            material=M[key],
+        )
+        sc.add_geometry(m, node_name=f'{name}_{i:03d}', geom_name=f'{name}_{i:03d}')
+    (MODEL_DIR / f'{name}.glb').write_bytes(sc.export(file_type='glb'))
+
+
+def normalize_model(name):
+    """Scale + translate the freshly written model onto its original bounding box
+    so the FIT_SIZE hotspot anchors stay valid for every regeneration."""
+    path = MODEL_DIR / f'{name}.glb'
+    scene = trimesh.load(str(path))
+    box = scene.bounding_box
+    nc = np.asarray(box.centroid)
+    ne = np.asarray(box.extents)
+    tgt = TARGET_BBOX[name]
+    oc = np.asarray(tgt["center"], dtype=float)
+    oe = np.asarray(tgt["extents"], dtype=float)
+    scale = (oe / ne).tolist()
+    T = np.eye(4)
+    T[:3, :3] = np.diag(scale)
+    T[:3, 3] = oc - nc * np.asarray(scale)
+    scene.apply_transform(T)
+    path.write_bytes(scene.export(file_type='glb'))
+
+# --- motherboard -----------------------------------------------------------
+def motherboard():
+    ms = [rbox((3.6, .14, 3.25), (0, 0, 0), 'board', .05, 8, 'xz')]
+    # CPU socket: silver frame + recessed socket + lever arm
+    ms += [rbox((1.15, .1, 1.15), (-.55, .12, -.18), 'silver', .03, 6, 'xz'),
+           rbox((.92, .12, .92), (-.55, .2, -.18), 'black', .025, 6, 'xz'),
+           rbox((.62, .05, .14), (-.55, .27, -.62), 'graphite', .02, 4, 'xz')]
+    # four DIMM slots: slot body + gold contact strip + two clip tabs
+    for x in [.55, .75, .95, 1.15]:
+        ms.append(rbox((.1, .18, 2.2), (x, .17, -.05), 'black', .02, 4, 'xz'))
+        ms.append(rbox((.05, .03, 1.9), (x, .27, -.05), 'gold', .012, 3, 'xz'))
+        for zc in [-1.0, 1.0]:
+            ms.append(rbox((.12, .07, .12), (x, .2, zc), 'cream', .015, 3, 'xz'))
+    # PCIe slots (x16 with a lane gap) + gold fingers + a short x1
+    for z, long in [(1.34, True), (.72, True)]:
+        gap = .04
+        ms.append(rbox((1.0, .13, .1), (-.7, .15, z), 'black', .02, 4, 'xy'))
+        ms.append(rbox((1.0, .13, .1), (.7, .15, z), 'black', .02, 4, 'xy'))
+        ms.append(rbox((1.4, .025, .045), (-.35, .235, z), 'gold', .01, 3, 'xy'))
+    ms.append(rbox((.5, .12, .09), (-.55, .15, 1.04), 'black', .02, 4, 'xy'))
+    ms.append(rbox((.42, .025, .04), (-.5, .225, 1.04), 'gold', .01, 3, 'xy'))
+    # VRM: two fin-stack heatsinks + capacitor cans between them
+    ms += fin_stack(.36, .52, .22, 11, (-1.2, .52, -1.0), 'heatsink')
+    ms += fin_stack(.36, .52, .22, 11, (-1.2, .52, -.7), 'heatsink')
+    for i in range(5):
+        ms += cap_can(.07, .2, (-1.05 + i * .2, .2, -.85), 'y', 'silver', 'graphite')
+    # chipset heatsink + accent logo
+    ms += [rbox((.66, .24, .66), (.92, .2, .88), 'silver', .03, 5, 'xz'),
+           fin_stack(.5, .2, .5, 7, (.92, .46, .88), 'heatsink'),
+           rbox((.34, .04, .34), (.92, .4, .88), 'cyan', .015, 4, 'xz')]
+    # M.2 heatsink + screw
+    ms += [rbox((.95, .08, .25), (.3, .15, -1.15), 'black', .02, 4, 'xz'),
+           rbox((.6, .025, .13), (.32, .215, -1.15), 'green', .01, 3, 'xz'),
+           cyl(.06, .05, (.32, .24, -1.15), 'y', 'silver', 18)]
+    # rear I/O shield plate with port cut-outs
+    ms += [rbox((.7, .62, .1), (0, .22, -1.46), 'silver', .03, 4, 'xy')]
+    for i, col in enumerate(['blue', 'blue', 'black', 'teal', 'amber']):
+        ms.append(rbox((.12, .12, .11), (-.24 + i * .12, .2 + (i % 2) * .26, -1.45), col, .01, 3, 'xy'))
+    ms.append(cyl(.1, .12, (.26, .22, -1.45), 'x', 'black', 18))
+    # capacitor array (electrolytic cans)
+    for i in range(8):
+        ms += cap_can(.065, .18, (-1.05 + i * .22, .16, .2), 'y', 'silver', 'graphite')
+    # decorative trace accents
+    for z in [-.75, -.55, .25, .45]:
+        ms.append(rbox((2.4, .018, .02), (0, .08, z), 'cyan', .005, 3, 'xz'))
+    # corner screws
+    for sx_, sz_ in [(-1.7, -1.5), (1.7, -1.5), (-1.7, 1.5), (1.7, 1.5)]:
+        ms += screw((sx_, .08, sz_), 'y', .045, 'silver', 'graphite')
+    return ms
+
+# --- cpu ------------------------------------------------------------------
+def cpu():
+    # green substrate + metallic IHS (heat spreader) with etched marking + pads
+    ms = [rbox((3.1, .18, 3.1), (0, -.28, 0), 'board2', .05, 8, 'xz'),
+          rbox((2.46, .3, 2.46), (0, .02, 0), 'silver', .05, 8, 'xz'),
+          rbox((2.2, .08, 2.2), (0, .2, 0), 'silver', .04, 6, 'xz')]
+    # laser-etched central rectangle + corner die dots
+    ms += [rbox((1.5, .02, 1.5), (0, .245, 0), 'deep', .03, 6, 'xz')]
+    for cx, cz in [(-.62, -.62), (.62, -.62), (-.62, .62), (.62, .62)]:
+        ms.append(rbox((.26, .02, .26), (cx, .245, cz), 'amber', .015, 4, 'xz'))
+    # retention-frame screws at the lid corners
+    for cx, cz in [(-1.05, -1.05), (1.05, -1.05), (-1.05, 1.05), (1.05, 1.05)]:
+        ms += screw((cx, .27, cz), 'y', .05, 'graphite', 'black')
+    # substrate gold pads on the underside
+    for x in np.linspace(-1.3, 1.3, 11):
+        for z in np.linspace(-1.3, 1.3, 11):
+            if abs(x) < .45 and abs(z) < .45:
+                continue
+            ms.append(cyl(.025, .035, (float(x), -.37, float(z)), 'y', 'gold', 12))
+    return ms
+
+# --- gpu ------------------------------------------------------------------
+def gpu():
+    ms = [rbox((3.65, .16, 2.0), (0, 0, 0), 'board', .04, 6, 'xz'),
+          rbox((3.8, .86, 2.2), (0, .3, 0), 'graphite', .06, 8, 'xz')]
+    # fin-stack heatsink beneath the shroud (the real cooling mass)
+    ms += fin_stack(3.0, .5, 1.9, 24, (0, .52, 0), 'heatsink')
+    # top ventilation slats on the shroud
+    ms += vent_slats(3.3, 1.9, (0, .78, 0), 'xz', 11, .12, .06, 'darkmetal')
+    # three fan wells + bladed fans
+    for x in [-1.18, 0, 1.18]:
+        ms.append(rbox((1.06, .04, 1.06), (x, .82, 0), 'deep', .03, 4, 'xz'))
+        ms += fan(.46, .12, (x, .9, 0), 'y', 9, 'graphite', 'silver')
+    # backplate with cut-outs + embossed branding
+    ms += [rbox((3.7, .06, 2.15), (0, -.34, 0), 'backplate', .03, 6, 'xz'),
+           rbox((.5, .07, .5), (-1.2, -.345, -.4), 'deep', .02, 4, 'xz'),
+           rbox((.5, .07, .5), (1.2, -.345, .4), 'deep', .02, 4, 'xz'),
+           rbox((2.4, .04, .12), (0, -.345, .9), 'cyan', .01, 3, 'xz')]
+    # VRM/power-stage blocks on the exposed PCB edge
+    for x in [-1.25, -.95, -.65, .45, .75, 1.05]:
+        ms.append(rbox((.22, .12, .42), (x, -.24, .55), 'black', .02, 4, 'xz'))
+    # PCIe gold fingers + 8-pin power connectors
+    for x in np.linspace(-1.25, .85, 18):
+        ms.append(rbox((.06, .07, .22), (float(x), -.18, 1.02), 'gold', .01, 3, 'xz'))
+    ms += [rbox((.46, .34, .3), (1.35, .15, -1.12), 'black', .03, 4, 'xy'),
+           rbox((.46, .34, .3), (.85, .15, -1.12), 'black', .03, 4, 'xy'),
+           rbox((.3, .05, .18), (1.35, .34, -1.12), 'amber', .01, 3, 'xy'),
+           rbox((.3, .05, .18), (.85, .34, -1.12), 'amber', .01, 3, 'xy')]
+    # display-output bracket with port holes
+    ms += [rbox((.1, .8, .3), (1.95, -.2, 0), 'silver', .02, 4, 'xz')]
+    for i in range(3):
+        ms.append(cyl(.07, .12, (1.96, -.05 - i * .22, 0), 'x', 'black', 18))
+    return ms
+
+# --- memory ---------------------------------------------------------------
+def memory():
+    ms = [rbox((3.6, .14, 1.25), (0, 0, 0), 'board2', .04, 6, 'xz')]
+    # ten DRAM ICs (etched black packages)
+    for x in np.linspace(-1.5, 1.5, 10):
+        ms.append(chip(.3, .62, .13, (float(x), .12, -.05), 'xz', 'chip'))
+    # brushed heatspreader top + finned edge + RGB diffuser strip
+    ms += [rbox((3.45, .16, .46), (0, .22, -.38), 'graphite', .03, 5, 'xz'),
+           rbox((3.45, .16, .16), (0, .25, .4), 'metal', .03, 5, 'xz'),
+           rbox((3.2, .05, .05), (0, .3, .48), 'cyan', .01, 3, 'xz')]
+    # gold edge contacts + key notch
+    for x in np.linspace(-1.62, 1.62, 28):
+        ms.append(rbox((.07, .04, .17), (float(x), -.06, .63), 'gold', .01, 3, 'xz'))
+    ms.append(rbox((.16, .16, .18), (.25, .02, .58), 'black', .02, 3, 'xz'))
+    return ms
+
+# --- storage --------------------------------------------------------------
+def storage():
+    ms = [rbox((3.55, .12, 1.25), (0, 0, 0), 'board', .04, 6, 'xz')]
+    # NAND / controller / DRAM packages on top
+    ms += [chip(.7, .62, .14, (-1.12, .12, 0), 'xz', 'chip'),
+           chip(.7, .62, .14, (.2, .12, 0), 'xz', 'chip'),
+           chip(.5, .5, .13, (1.16, .11, 0), 'xz', 'chip')]
+    # silk-screen label sticker
+    ms += [rbox((2.6, .04, .9), (0, .18, 0), 'cream', .02, 4, 'xz'),
+           rbox((2.7, .045, .95), (0, .18, 0), 'green', .012, 3, 'xz')]
+    # gold edge connector (two groups) + mounting screw hole
+    for x in np.linspace(-1.65, -1.28, 8):
+        ms.append(rbox((.035, .045, .22), (float(x), -.03, .61), 'gold', .008, 3, 'xz'))
+    for x in np.linspace(-1.15, -.65, 9):
+        ms.append(rbox((.035, .045, .22), (float(x), -.03, .61), 'gold', .008, 3, 'xz'))
+    ms += [cyl(.12, .08, (1.62, .06, 0), 'y', 'silver', 28),
+           cyl(.055, .1, (1.62, .08, 0), 'y', 'black', 28)]
+    return ms
+
+# --- power ----------------------------------------------------------------
+def power():
+    ms = [rbox((3.25, 2.7, 2.45), (0, 0, 0), 'graphite', .1, 10, 'xy')]
+    # top intake fan + stamped mesh grille
+    ms += fan(.9, .06, (0, 1.4, 0), 'y', 13, 'black', 'silver')
+    ms += grille(1.9, 1.9, (0, 1.42, 0), pitch=.2, bar=.03, border=.1, depth=.06, material='darkmetal', plane='xy')
+    # modular connector bank with gold pin dots
+    for r in [-.65, 0, .65]:
+        for c in [-.95, -.35, .35, .95]:
+            ms.append(rbox((.42, .12, .32), (c, .25, 1.3), 'black', .02, 4, 'xy'))
+            for k in range(4):
+                ms.append(cyl(.022, .06, (c - .14 + k * .09, .32, 1.3), 'y', 'gold', 12))
+    # rear AC inlet + power switch
+    ms += [rbox((.5, .5, .16), (-.7, -.5, 1.3), 'black', .03, 4, 'xy'),
+           cyl(.18, .14, (-.7, -.5, 1.4), 'z', 'metal', 24),
+           rbox((.34, .3, .16), (.55, -.55, 1.3), 'red', .03, 4, 'xy')]
+    # internals: transformer, main capacitors, inductors
+    ms += [rbox((.92, .85, .82), (-.72, -.35, -.15), 'amber', .04, 5, 'xy'),
+           cap_can(.27, .82, (.58, -.45, -.45), 'y', 'silver', 'graphite'),
+           cap_can(.27, .82, (1.0, -.45, -.45), 'y', 'silver', 'graphite')]
+    for x in [-.1, .2, .5]:
+        ms.append(cyl(.18, .56, (x, -.65, .4), 'x', 'orange', 28))
+    # spec label + corner screws
+    ms += [rbox((1.6, 1.2, .03), (.2, .0, -1.22), 'cream', .03, 4, 'xy'),
+           rbox((1.7, 1.3, .035), (.2, .0, -1.22), 'amber', .01, 3, 'xy')]
+    for sx_, sz_ in [(-1.5, -1.1), (1.5, -1.1), (-1.5, 1.1), (1.5, 1.1)]:
+        ms += screw((sx_, 1.38, sz_), 'y', .06, 'silver', 'graphite')
+    return ms
+
+# --- cooling --------------------------------------------------------------
+def cooling():
+    ms = []
+    # copper base + U-shaped heatpipes
+    ms += [rbox((1.5, .22, 1.35), (0, -1.25, 0), 'silver', .04, 5, 'xz')]
+    for x in [-.55, -.2, .2, .55]:
+        ms += [tube(.07, 2.6, (x, 0, 0), 'y', 'orange'),
+               tube(.07, 1.05, (x, 1.2, .35), 'z', 'orange')]
+    ms.append(tube(.07, 1.5, (0, 1.2, .35), 'x', 'orange'))
+    # dense aluminium fin stack (the signature cooler silhouette)
+    ms += fin_stack(2.5, 2.0, 1.3, 38, (0, .0, .2), 'heatsink', fill=.62)
+    # front fan + wire grille + mounting frame
+    ms += fan(.82, .12, (0, .2, 1.05), 'z', 9, 'graphite', 'silver')
+    ms += grille(1.7, 1.7, (0, .2, 1.08), pitch=.22, bar=.03, border=.08, depth=.05, material='darkmetal', plane='xy')
+    for x in [-1.25, 1.25]:
+        ms.append(rbox((.1, .1, 1.3), (x, .2, .2), 'darkmetal', .02, 3, 'xz'))
+    return ms
+
+# --- network --------------------------------------------------------------
+def network():
+    ms = [rbox((3.55, .12, 2.0), (0, 0, 0), 'board', .04, 6, 'xz')]
+    # metal bracket + RJ45 port (mesh) + SFP cage
+    ms += [rbox((.14, .2, 2.2), (-1.72, .1, 0), 'silver', .02, 4, 'xz'),
+           rbox((.5, .34, .55), (-1.55, .2, .55), 'black', .03, 4, 'xz'),
+           grille(.4, .4, (-1.55, .2, .55), pitch=.1, bar=.02, border=.04, depth=.05, material='darkmetal', plane='xy'),
+           rbox((.42, .32, .42), (-1.55, .2, -.5), 'metal', .03, 4, 'xz')]
+    # controller + PHY ICs (etched packages)
+    ms += [chip(1.0, 1.0, .26, (-.2, .2, 0), 'xz', 'chip'),
+           rbox((.72, .08, .72), (-.2, .38, 0), 'teal', .02, 4, 'xz')]
+    for x, z in [(.7, .5), (1.15, .5), (.7, -.35), (1.15, -.35)]:
+        ms.append(chip(.34, .34, .15, (x, .14, z), 'xz', 'chip'))
+    # crystal + caps
+    ms += [rbox((.45, .18, .22), (.55, .17, -.85), 'cream', .02, 4, 'xz')]
+    for x in [.85, 1.1, 1.35]:
+        ms += cap_can(.07, .18, (x, .16, -.85), 'y', 'silver', 'graphite')
+    # PCIe gold fingers
+    for x in np.linspace(-.7, 1.55, 22):
+        ms.append(rbox((.055, .045, .18), (float(x), -.05, 1.0), 'gold', .01, 3, 'xz'))
+    return ms
+
+# --- case/system ----------------------------------------------------------
+def case():
+    ms = []
+    # aluminium frame rails + corner gussets
+    for x in [-1.55, 1.55]:
+        for z in [-1.15, 1.15]:
+            ms.append(cyl(.07, 3.4, (x, 0, z), 'y', 'silver', 16))
+    for y in [-1.65, 1.65]:
+        ms.append(cyl(.07, 3.2, (0, y, -1.15), 'z', 'silver', 16))
+        ms.append(cyl(.07, 3.2, (0, y, 1.15), 'z', 'silver', 16))
+        ms.append(cyl(.07, 2.3, (-1.55, y, 0), 'x', 'silver', 16))
+        ms.append(cyl(.07, 2.3, (1.55, y, 0), 'x', 'silver', 16))
+    for x in [-1.55, 1.55]:
+        for y in [-1.65, 1.65]:
+            for z in [-1.15, 1.15]:
+                ms.append(rbox((.18, .18, .18), (x, y, z), 'darkmetal', .03, 4, 'xy'))
+    # tempered-glass right side panel (translucent, shows internals)
+    ms.append(rbox((.04, 2.9, 2.35), (1.57, .1, 0), 'glass', .02, 5, 'xy'))
+    # front mesh bezel + intake fans behind it
+    ms += grille(2.7, 2.8, (-.18, .1, 1.16), pitch=.26, bar=.05, border=.12, depth=.06, material='darkmetal', plane='xy')
+    for y in [-.75, .05, .85]:
+        ms += fan(.38, .08, (1.55, y, .6), 'x', 9, 'black', 'cyan')
+    # top dust-filter grille
+    ms += grille(2.9, 2.3, (-.18, 1.62, 0), pitch=.3, bar=.05, border=.1, depth=.05, material='darkmetal', plane='xz')
+    # front I/O: power button + two USB ports
+    ms += [cyl(.14, .1, (-.18, 1.5, 1.05), 'z', 'cyan', 20),
+           rbox((.18, .1, .12), (-.7, 1.5, 1.05), 'black', .02, 3, 'xy'),
+           rbox((.18, .1, .12), (-.45, 1.5, 1.05), 'black', .02, 3, 'xy')]
+    # internal: motherboard plane, CPU cooler, RAM, GPU, PSU, storage
+    ms += [rbox((2.45, 2.65, .08), (-.18, .1, -.72), 'board', .03, 5, 'xy'),
+           rbox((.72, .72, .35), (-.45, .55, -.46), 'silver', .04, 5, 'xz'),
+           cyl(.3, .14, (-.45, .55, -.22), 'z', 'black', 36)]
+    for x in [.05, .22]:
+        ms.append(rbox((.09, 1.05, .14), (x, .3, -.52), 'cyan', .015, 3, 'xy'))
+    ms += [rbox((2.5, .42, .65), (.1, -.45, .0), 'graphite', .04, 5, 'xz'),
+           cyl(.27, .08, (-.55, -.67, .34), 'y', 'black', 32),
+           cyl(.27, .08, (.35, -.67, .34), 'y', 'black', 32),
+           rbox((1.25, .68, 1.6), (.65, -1.15, -.15), 'graphite', .04, 5, 'xy'),
+           rbox((.9, .18, .65), (-.9, -1.25, .2), 'metal', .03, 4, 'xz')]
+    # rubber feet
+    for sx_, sz_ in [(-1.4, -1.0), (1.4, -1.0), (-1.4, 1.0), (1.4, 1.0)]:
+        ms.append(cyl(.12, .14, (sx_, -1.72, sz_), 'y', 'darkmetal', 18))
+    return ms
+
+builders = {
+    'motherboard': motherboard, 'cpu': cpu, 'gpu': gpu, 'memory': memory,
+    'storage': storage, 'power': power, 'cooling': cooling, 'network': network, 'case': case,
+}
+FLAT = {'motherboard', 'cpu', 'gpu', 'memory', 'storage', 'network'}
+for name, fn in builders.items():
+    print('generating', name)
+    meshes = fn()
+    if name in FLAT:
+        rot = trimesh.transformations.rotation_matrix(math.pi / 2, [1, 0, 0])
+        for m in meshes:
+            if isinstance(m, list):
+                for sub in m:
+                    sub.apply_transform(rot)
+            else:
+                m.apply_transform(rot)
+    scene_export(name, meshes)
+    normalize_model(name)
+
+# --- 2D learning assets ---------------------------------------------------
+FONT_CANDIDATES = ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+                   '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf']
+FONT_BOLD_CANDIDATES = ['/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+                        '/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf']
+def getfont(size, bold=False):
+    for f in (FONT_BOLD_CANDIDATES if bold else FONT_CANDIDATES):
+        if os.path.exists(f):
+            return ImageFont.truetype(f, size)
+    return ImageFont.load_default()
+
+def rounded(draw, xy, r, fill, outline=None, width=1):
+    draw.rounded_rectangle(xy, radius=r, fill=fill, outline=outline, width=width)
+
+def base_canvas(w=760, h=560):
+    im = Image.new('RGB', (w, h), '#071014')
+    d = ImageDraw.Draw(im)
+    for x in range(0, w, 40):
+        d.line((x, 0, x, h), fill='#0d2026', width=1)
+    for y in range(0, h, 40):
+        d.line((0, y, w, y), fill='#0d2026', width=1)
+    glow = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    for r, a in [(250, 12), (190, 16), (130, 20)]:
+        gd.ellipse((w // 2 - r, h // 2 - r, w // 2 + r, h // 2 + r), fill=(70, 215, 230, a))
+    glow = glow.filter(ImageFilter.GaussianBlur(35))
+    im = Image.alpha_composite(im.convert('RGBA'), glow).convert('RGB')
+    return im
+
+def draw_component_icon(d, name, cx, cy, s=1.0):
+    line = '#6be0ea'; fill = '#17323a'; metal = '#9db0b9'; dark = '#0d171c'; amber = '#e9b44c'
+    if name == 'motherboard':
+        rounded(d, (cx - 150 * s, cy - 115 * s, cx + 150 * s, cy + 115 * s), 12 * s, fill, outline=line, width=max(1, int(3 * s)))
+        rounded(d, (cx - 70 * s, cy - 60 * s, cx + 20 * s, cy + 30 * s), 8 * s, metal, outline='#d9e5e8', width=max(1, int(2 * s)))
+        for x in [60, 80, 100]:
+            rounded(d, (cx + x * s, cy - 75 * s, cx + (x + 8) * s, cy + 60 * s), 3 * s, dark, outline=line)
+        for z in [45, 70]:
+            rounded(d, (cx - 85 * s, cy + z * s, cx + 70 * s, cy + (z + 8) * s), 3 * s, dark, outline=amber)
+    elif name == 'cpu':
+        rounded(d, (cx - 125 * s, cy - 125 * s, cx + 125 * s, cy + 125 * s), 18 * s, '#1a3a41', outline=amber, width=max(1, int(3 * s)))
+        rounded(d, (cx - 90 * s, cy - 90 * s, cx + 90 * s, cy + 90 * s), 15 * s, metal, outline='#dae6e8', width=max(1, int(3 * s)))
+        for dx, dy, co in [(-45, -45, line), (45, -45, '#709cff'), (-45, 45, '#a989e6'), (45, 45, '#45c6ad')]:
+            rounded(d, (cx + (dx - 32) * s, cy + (dy - 32) * s, cx + (dx + 32) * s, cy + (dy + 32) * s), 8 * s, co)
+    elif name == 'gpu':
+        rounded(d, (cx - 170 * s, cy - 80 * s, cx + 170 * s, cy + 80 * s), 18 * s, '#252f36', outline=line, width=max(1, int(3 * s)))
+        for x in [-105, 0, 105]:
+            d.ellipse((cx + (x - 48) * s, cy - 48 * s, cx + (x + 48) * s, cy + 48 * s), fill=dark, outline=metal, width=max(1, int(3 * s)))
+            d.ellipse((cx + (x - 13) * s, cy - 13 * s, cx + (x + 13) * s, cy + 13 * s), fill=line)
+    elif name == 'memory':
+        rounded(d, (cx - 175 * s, cy - 62 * s, cx + 175 * s, cy + 62 * s), 10 * s, fill, outline=line, width=max(1, int(3 * s)))
+        for x in np.linspace(-145, 145, 8):
+            rounded(d, (cx + (x - 16) * s, cy - 25 * s, cx + (x + 16) * s, cy + 25 * s), 4 * s, dark)
+        for x in np.linspace(-160, 160, 18):
+            d.rectangle((cx + (x - 3) * s, cy + 62 * s, cx + (x + 3) * s, cy + 78 * s), fill=amber)
+    elif name == 'storage':
+        rounded(d, (cx - 175 * s, cy - 62 * s, cx + 175 * s, cy + 62 * s), 10 * s, fill, outline=line, width=max(1, int(3 * s)))
+        rounded(d, (cx - 135 * s, cy - 42 * s, cx - 65 * s, cy + 42 * s), 8 * s, metal)
+        for x in [-25, 45, 115]:
+            rounded(d, (cx + (x - 28) * s, cy - 35 * s, cx + (x + 28) * s, cy + 35 * s), 6 * s, dark)
+        d.ellipse((cx + 145 * s, cy - 12 * s, cx + 169 * s, cy + 12 * s), fill='#071014', outline=metal, width=max(1, int(3 * s)))
+    elif name == 'power':
+        rounded(d, (cx - 145 * s, cy - 110 * s, cx + 145 * s, cy + 110 * s), 16 * s, '#252f36', outline=metal, width=max(1, int(3 * s)))
+        d.ellipse((cx - 70 * s, cy - 70 * s, cx + 70 * s, cy + 70 * s), fill=dark, outline=line, width=max(1, int(3 * s)))
+        d.ellipse((cx - 17 * s, cy - 17 * s, cx + 17 * s, cy + 17 * s), fill=metal)
+    elif name == 'cooling':
+        for y in range(-80, 90, 10):
+            d.rectangle((cx - 90 * s, cy + (y - 2) * s, cx + 90 * s, cy + (y + 2) * s), fill=metal)
+        for x in [-45, -15, 15, 45]:
+            d.line((cx + x * s, cy + 95 * s, cx + x * s, cy - 90 * s), fill=amber, width=max(2, int(5 * s)))
+        d.ellipse((cx - 70 * s, cy - 60 * s, cx + 70 * s, cy + 80 * s), fill=dark, outline=line, width=max(1, int(3 * s)))
+        d.ellipse((cx - 14 * s, cy + 0 * s, cx + 14 * s, cy + 28 * s), fill=metal)
+    elif name == 'network':
+        rounded(d, (cx - 165 * s, cy - 90 * s, cx + 145 * s, cy + 90 * s), 12 * s, fill, outline=line, width=max(1, int(3 * s)))
+        rounded(d, (cx - 55 * s, cy - 48 * s, cx + 35 * s, cy + 42 * s), 8 * s, metal)
+        rounded(d, (cx - 155 * s, cy - 35 * s, cx - 105 * s, cy + 35 * s), 4 * s, '#64737c', outline='#d2dde0')
+        for x in [65, 105]:
+            rounded(d, (cx + (x - 18) * s, cy - 20 * s, cx + (x + 18) * s, cy + 18 * s), 4 * s, dark)
+    elif name == 'case':
+        rounded(d, (cx - 115 * s, cy - 150 * s, cx + 115 * s, cy + 150 * s), 18 * s, '#142127', outline=metal, width=max(1, int(4 * s)))
+        rounded(d, (cx - 90 * s, cy - 120 * s, cx + 90 * s, cy + 115 * s), 8 * s, '#0d1a20', outline=line, width=max(1, int(2 * s)))
+        d.rectangle((cx - 68 * s, cy - 80 * s, cx + 42 * s, cy + 20 * s), outline='#2bb7a9', width=max(1, int(3 * s)))
+        d.rectangle((cx - 55 * s, cy + 35 * s, cx + 60 * s, cy + 65 * s), fill='#26343c')
+        for yy in [-80, 0, 80]:
+            d.ellipse((cx + 65 * s, cy + (yy - 22) * s, cx + 109 * s, cy + (yy + 22) * s), outline=line, width=max(1, int(3 * s)))
+
+LABELS = {
+    'motherboard': ('Motherboard', 'System interconnect'), 'cpu': ('CPU', 'Compute engine'),
+    'gpu': ('GPU', 'Parallel processor'),
+    'memory': ('Memory', 'Working data'), 'storage': ('NVMe SSD', 'Persistent data'),
+    'power': ('Power Supply', 'Power conversion'),
+    'cooling': ('Cooling', 'Thermal control'), 'network': ('Network Adapter', 'Data link'),
+    'case': ('System Chassis', 'Integrated computer')}
+
+def save_asset(name, kind):
+    if kind == 'thumb':
+        im = base_canvas(320, 320); d = ImageDraw.Draw(im); draw_component_icon(d, name, 160, 158, .75)
+    else:
+        im = base_canvas(); d = ImageDraw.Draw(im)
+        title, sub = LABELS[name]
+        d.text((40, 32), title, font=getfont(34, True), fill='#eaf4f5')
+        d.text((42, 75), sub.upper(), font=getfont(13, True), fill='#55d8e8')
+        if kind == 'organ':
+            draw_component_icon(d, name, 380, 305, 1.15)
+            d.text((40, 510), 'INTERACTIVE HARDWARE SPECIMEN', font=getfont(13, True), fill='#6b8089')
+        elif kind == 'microscopic':
+            draw_component_icon(d, name, 220, 315, .8)
+            for i, (tx, ty) in enumerate([(470, 185), (560, 275), (470, 365), (590, 440)]):
+                rounded(d, (tx - 55, ty - 38, tx + 55, ty + 38), 10, '#122a2e', outline='#55d8e8', width=2)
+                d.text((tx - 38, ty - 7), f'L{i+1}', font=getfont(18, True), fill='#eaf4f5')
+                d.line((330, 300, tx - 55, ty), fill='#356d75', width=2)
+            d.text((445, 500), 'BOARD / SILICON LEVEL', font=getfont(13, True), fill='#6b8089')
+        elif kind == 'compare':
+            draw_component_icon(d, name, 205, 300, .72)
+            draw_component_icon(d, 'case' if name != 'case' else 'motherboard', 555, 300, .6)
+            d.line((380, 145, 380, 470), fill='#2c464e', width=2)
+            d.text((338, 276), 'VS', font=getfont(28, True), fill='#efb54a')
+            d.text((73, 482), LABELS[name][0], font=getfont(16, True), fill='#eaf4f5')
+            other = 'System Chassis' if name != 'case' else 'Motherboard'
+            d.text((470, 482), other, font=getfont(16, True), fill='#eaf4f5')
+        elif kind == 'location':
+            draw_component_icon(d, 'case', 380, 300, 1.0)
+            p = {'motherboard': (325, 285), 'cpu': (345, 260), 'gpu': (355, 345), 'memory': (390, 275),
+                 'storage': (330, 390), 'power': (430, 390), 'cooling': (345, 245), 'network': (350, 360),
+                 'case': (380, 300)}[name]
+            for r, a in [(38, '#55d8e8'), (25, '#071014'), (10, '#efb54a')]:
+                d.ellipse((p[0] - r, p[1] - r, p[0] + r, p[1] + r), outline=a, width=4)
+            d.text((40, 510), 'POSITION IN THE COMPUTER SYSTEM', font=getfont(13, True), fill='#6b8089')
+    out = ART_DIR / name
+    out.mkdir(exist_ok=True)
+    im.save(out / f'{kind}.webp', 'WEBP', quality=90, method=6)
+
+for n in builders:
+    for k in ['thumb', 'organ', 'microscopic', 'compare', 'location']:
+        save_asset(n, k)
+print('generated models and 2D assets')
